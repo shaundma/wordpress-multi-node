@@ -16,17 +16,17 @@ nodes:
     engine: "${settings.php_engine:php8.4}"
     nodeGroup: cp
     count: 1
-    cloudlets: 8
+    cloudlets: 16
     displayName: Nginx PHP Web Server
   - nodeType: mariadb
     nodeGroup: sqldb
     count: 1
-    cloudlets: 8
+    cloudlets: 16
     displayName: MariaDB Database
   - nodeType: redis
     nodeGroup: cache
     count: 1
-    cloudlets: 4
+    cloudlets: 8
     displayName: Redis Cache
 
 skipNodeEmails: true
