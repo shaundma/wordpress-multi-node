@@ -1,0 +1,244 @@
+jpsType: install
+jpsVersion: '1.7.2'
+id: wordpress-multi-node
+name: WordPress Multi-Node Kit
+categories:
+  - apps/blogs
+  - apps/content-management
+logo: https://raw.githubusercontent.com/jelastic-jps/wordpress/master/images/wp-standalone.png
+homepage: http://wordpress.org/
+description:
+  text: WordPress deployed across multiple nodes with Nginx and PHP as the application server, MariaDB for the database, and Redis for caching, optimized for performance and scalability.
+  short: WordPress with Nginx, PHP, MariaDB, and Redis nodes for enhanced performance.
+
+nodes:
+  - nodeType: nginxphp
+    engine: "${settings.php_engine:php8.4}"
+    nodeGroup: cp
+    count: 1
+    cloudlets: 8
+    displayName: Nginx PHP Web Server
+  - nodeType: mariadb
+    nodeGroup: sqldb
+    count: 1
+    cloudlets: 8
+    displayName: MariaDB Database
+  - nodeType: redis
+    nodeGroup: cache
+    count: 1
+    cloudlets: 4
+    displayName: Redis Cache
+
+skipNodeEmails: true
+
+settings:
+  fields:
+    - caption: PHP version
+      type: list
+      name: php_engine
+      default: php8.4
+      required: true
+      width: 225
+      values:
+        - value: php8.4
+          caption: PHP 8.4
+        - value: php8.3
+          caption: PHP 8.3
+        - value: php8.2
+          caption: PHP 8.2
+
+    - caption: Install Let's Encrypt SSL with Auto-Renewal
+      type: checkbox
+      name: le-addon
+      value: true
+      disabled: false
+      tooltip: "Automates issuing, configuring, and updating trusted SSL certificates via Let's Encrypt."
+    - caption: Install WooCommerce
+      type: checkbox
+      name: woocommerce
+      value: false
+      disabled: false
+      tooltip: "Installs WooCommerce, a free e-commerce plugin for WordPress."
+
+globals:
+  DB_USER: ${settings.DB_USER:user-[fn.random]}
+  DB_PASS: ${settings.DB_PASS:[fn.password(10)]}
+  DB_HOST: ${nodes.sqldb.master.address}
+  REDIS_HOST: ${nodes.cache.master.address}
+  REDIS_PORT: 6379
+  WP_ADMIN_PASS: ${settings.WP_ADMIN_PASS:[fn.password(10)]}
+  PROTOCOL: http
+  SUCCESS: default
+  SUDO_USER: nginx
+
+onInstall:
+  - log: "DEBUG: Starting installation with corrected script version (2025-10-16, nginx user, Redis config above stop editing, v41)"
+  - enableRootAccess
+  - setupEnvironment
+  - setProtocol
+  - setDomain
+  - createUserDB
+  - getRedisPswd
+  - installWordpress
+  - if (${settings.le-addon:false}):
+      - installLEaddon
+      - setupLEdomain
+  - if (${settings.woocommerce:false}): installWoocommerce
+  - if ('${settings.success_email}' != 'false'):
+      - return:
+          type: success
+          message: /success/text/success-${globals.SUCCESS}.md?_r=${fn.random}
+          email: /success/email/success-nginx-${globals.SUCCESS}.md?_r=${fn.random}
+
+actions:
+  enableRootAccess:
+    - log: Enabling root access via sudo for nginx user on all nodes
+    - cmd[cp, sqldb, cache]: |- 
+        TARGET_UID=$(id -u nginx 2>/dev/null) || TARGET_UID="700"
+        getent passwd "${TARGET_UID}" &>/dev/null && TARGET_USER=$(getent passwd "${TARGET_UID}" | cut -d: -f1) || TARGET_USER="nginx"
+        sed -i "\$a${TARGET_USER}\ ALL=NOPASSWD:\ ALL" /etc/sudoers
+        echo "DEBUG: Sudo user configured: ${TARGET_USER}"
+      user: root
+    - setGlobals:
+        SUDO_USER: ${response.out}
+
+  setupEnvironment:
+    - log: Configuring environment nodes
+    - env.control.ApplyNodeGroupData[cp]:
+        data:
+          project: ${settings.project:default}
+          projectScope: ${settings.projectScope:production}
+          validation:
+            maxCount: 1
+    - install: https://raw.githubusercontent.com/jelastic/templates/master/config_v2.jps?_r=${fn.random}
+      settings:
+        targetGroup: cp
+        targetNodes: ${nodes.cp.master.id}
+        optimization: wordpress
+    - cmd[cp]: |- 
+        mkdir -p /var/www/webroot/ROOT
+        echo -e "server {\n  listen 80;\n  server_name ${env.domain};\n  root /var/www/webroot/ROOT;\n  index index.php;\n  location / {\n    try_files \$uri \$uri/ /index.php?\$args;\n  }\n  location ~ \\.php\$ {\n    include fastcgi_params;\n    fastcgi_pass 127.0.0.1:9000;\n    fastcgi_index index.php;\n    fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;\n  }\n}" > /etc/nginx/conf.d/wordpress.conf
+        systemctl reload nginx
+        echo "DEBUG: PHP version:"
+        php -v || { echo "ERROR: PHP not installed" >&2; exit 1; }
+        echo "DEBUG: PHP binary location:"
+        which php || echo "ERROR: PHP binary not found"
+      user: root
+    - cmd[cache]: |- 
+        redis-server --daemonize yes
+      user: root
+
+  setProtocol:
+    - script: |
+        return {
+          result: 0,
+          ssl: jelastic.billing.account.GetQuotas('environment.jelasticssl.enabled').array[0].value
+        }
+    - if (${response.ssl} || ${settings.le-addon:false}):
+        setGlobals:
+          PROTOCOL: https
+
+  setDomain:
+    - setGlobals:
+        DOMAIN: ${env.domain}
+
+  createUserDB:
+    - log: Create database user for WordPress
+    - cmd[sqldb]: |- 
+        if [ ! -f /root/.my.cnf ]; then
+          echo "ERROR: /root/.my.cnf not found" >&2
+          exit 1
+        fi
+        echo "[client]" >> /root/.my.cnf
+        grep -E '^(user|password) =' /root/.my.cnf | grep -v '\[mysqladmin\]' >> /root/.my.cnf
+        chmod 600 /root/.my.cnf
+        echo "DEBUG: Content of /root/.my.cnf after appending [client]:"
+        cat /root/.my.cnf
+        echo "DEBUG: Testing MySQL connection:"
+        mysql --defaults-file=/root/.my.cnf -e "SELECT 1;" || { echo "ERROR: MySQL connection failed" >&2; exit 1; }
+        echo "DEBUG: Checking root user authentication plugin:"
+        mysql --defaults-file=/root/.my.cnf -e "SELECT user, host, plugin FROM mysql.user WHERE user = 'root';" || { echo "ERROR: Failed to check root user plugin" >&2; exit 1; }
+        mysql --defaults-file=/root/.my.cnf -e "CREATE USER IF NOT EXISTS '${globals.DB_USER}'@'%' IDENTIFIED BY '${globals.DB_PASS}';"
+        mysql --defaults-file=/root/.my.cnf -e "CREATE DATABASE IF NOT EXISTS wordpress;"
+        mysql --defaults-file=/root/.my.cnf -e "GRANT ALL PRIVILEGES ON wordpress.* TO '${globals.DB_USER}'@'%';"
+        mysql --defaults-file=/root/.my.cnf -e "FLUSH PRIVILEGES;"
+      user: root
+
+  getRedisPswd:
+    - log: Extracting Redis password from cache node
+    - cmd[cache]: |- 
+        cat /etc/redis.conf | tail -1 | awk '{print $2}'
+      user: root
+    - setGlobals:
+        REDIS_PSWD: ${response.out}
+    - cmd[cache]: |- 
+        echo "DEBUG: Redis password extracted: ${globals.REDIS_PSWD}"
+
+  installWordpress:
+    - log: Installing WordPress
+    - cmd[cp]: |- 
+        curl -s https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /usr/local/bin/wp
+        chmod 755 /usr/local/bin/wp
+        echo "DEBUG: Verifying WP-CLI installation:"
+        ls -l /usr/local/bin/wp
+        wget -q https://wordpress.org/latest.tar.gz -O /tmp/wordpress.tar.gz
+        tar -xzf /tmp/wordpress.tar.gz -C /var/www/webroot/ROOT --strip-components=1
+        chown -R nginx:nginx /var/www/webroot/ROOT
+      user: root
+    - cmd[cp]: |- 
+        echo "DEBUG: nginx user PATH:"
+        sudo -u nginx env | grep PATH
+        echo "DEBUG: Testing WP-CLI as nginx user:"
+        sudo -u nginx /usr/local/bin/wp --info --path=/var/www/webroot/ROOT || { echo "ERROR: WP-CLI not accessible as nginx user" >&2; exit 1; }
+        echo "DEBUG: Testing Redis connection:"
+        sudo -u nginx redis-cli -h ${globals.REDIS_HOST} -p ${globals.REDIS_PORT} -a "${globals.REDIS_PSWD}" ping || { echo "ERROR: Redis connection failed" >&2; exit 1; }
+        sudo -u nginx /usr/local/bin/wp config create --dbname=wordpress --dbuser=${globals.DB_USER} --dbpass=${globals.DB_PASS} --dbhost=${globals.DB_HOST} --path=/var/www/webroot/ROOT
+        echo "DEBUG: Adding Redis configuration to wp-config.php"
+        sudo -u nginx /bin/bash -c "sed -i \"/\\/\\* That's all, stop editing! Happy publishing. \\*\\//i define('WP_REDIS_SCHEME', 'tcp');\\ndefine('WP_REDIS_HOST', '${globals.REDIS_HOST}');\\ndefine('WP_REDIS_PORT', ${globals.REDIS_PORT});\\ndefine('WP_REDIS_PASSWORD', '${globals.REDIS_PSWD}');\\ndefine('WP_REDIS_DATABASE', '1');\" /var/www/webroot/ROOT/wp-config.php"
+        sudo -u nginx /usr/local/bin/wp core install --url=${globals.PROTOCOL}://${globals.DOMAIN} --title="WordPress Site" --admin_user=admin --admin_password=${globals.WP_ADMIN_PASS} --admin_email=admin@example.com --path=/var/www/webroot/ROOT
+        sudo -u nginx /usr/local/bin/wp plugin install redis-cache --activate --path=/var/www/webroot/ROOT
+        echo "DEBUG: Attempting to enable Redis cache"
+        sudo -u nginx /usr/local/bin/wp redis enable --path=/var/www/webroot/ROOT
+      user: root
+
+  installLEaddon:
+    - install: https://github.com/jelastic-jps/lets-encrypt/blob/master/manifest.jps?_r=${fn.random}
+      nodeGroup: cp
+      skipEmail: true
+      settings:
+        test: false
+        fallbackToX1: true
+        withExtIp: ${globals.isExtIP}
+
+  initLEsettings:
+    - script: |
+        return {
+          result: 0,
+          extIP: Boolean(jelastic.billing.account.GetQuotas('environment.externalip.enabled').array[0].value)
+        }
+    - setGlobals:
+        isExtIP: ${response.extIP}
+    - cmd[cp]: |- 
+        [ ! -d /var/lib/jelastic/keys/letsencrypt ] && mkdir -p /var/lib/jelastic/keys/letsencrypt
+        echo "webroot=true" > /var/lib/jelastic/keys/letsencrypt/settings-custom
+        echo "webrootPath=/var/www/webroot/ROOT" >> /var/lib/jelastic/keys/letsencrypt/settings-custom
+        echo "test=false" > /var/lib/jelastic/keys/letsencrypt/settings-custom
+        echo "withExtIp=${globals.isExtIP}" >> /var/lib/jelastic/keys/letsencrypt/settings-custom
+      user: root
+
+  setupLEdomain:
+    - cmd[cp]: |- 
+        mkdir -p ~/bin
+        wget -q https://raw.githubusercontent.com/jelastic-jps/wordpress-cluster/v2.2.0/scripts/setupWP.sh -O ~/bin/setupWP.sh
+        chmod +x ~/bin/setupWP.sh
+        echo "DEBUG: Downloaded setupWP.sh to ~/bin/"
+        source /opt/letsencrypt/settings
+        bash ~/bin/setupWP.sh --url https://${globals.DOMAIN}
+      user: root
+
+  installWoocommerce:
+    - cmd[cp]: |- 
+        sudo -u nginx /usr/local/bin/wp plugin install woocommerce --activate --path=/var/www/webroot/ROOT
+      user: root
+
+startPage: ${env.url}
